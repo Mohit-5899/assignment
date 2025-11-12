@@ -18,4 +18,5 @@ temp_*.pdf
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.db.env
+__pycache__/
