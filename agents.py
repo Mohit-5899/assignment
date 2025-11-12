@@ -3,11 +3,13 @@ import json
 import logging
 import time
 from typing import List, Optional
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.tools import tool
 from langchain.tools.retriever import create_retriever_tool
+from langchain_core.retrievers import BaseRetriever
+from pydantic import ConfigDict
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 from config import Config
@@ -120,8 +122,36 @@ class RAGAgent:
         self.collection_name = Config.VECTOR_COLLECTION
         self._collection_created = False
     
-    def _ensure_collection(self, vector_size: int):
+    def _ensure_collection(self, vector_size: Optional[int] = None, *, force_refresh: bool = False):
         """Ensure Qdrant collection exists with retry logic."""
+        if self._collection_created and not force_refresh:
+            return
+
+        if vector_size is None:
+            # Only allowed when we're refreshing metadata for an existing collection
+            # Vector size is required when creating a new collection from scratch
+            try:
+                collection_info = self.qdrant_client.get_collection(self.collection_name)
+                inferred_size = None
+                if hasattr(collection_info.config.params, "vectors"):
+                    vectors = collection_info.config.params.vectors
+                    if hasattr(vectors, "size"):
+                        inferred_size = vectors.size
+                    elif isinstance(vectors, dict):
+                        first_vector = next(iter(vectors.values()), None)
+                        if isinstance(first_vector, rest.VectorParams):
+                            inferred_size = first_vector.size
+                vector_size = inferred_size
+            except Exception:
+                vector_size = None
+
+        if vector_size is None and not force_refresh:
+            raise ValueError("vector_size must be provided when creating a new collection.")
+
+        # When force_refresh is True, attempt to re-derive metadata even if collection already created
+        if force_refresh:
+            self._collection_created = False
+
         if not self._collection_created:
             max_retries = 3
             retry_delay = 2
@@ -153,6 +183,11 @@ class RAGAgent:
                     
                 except Exception as e:
                     if "not found" in str(e).lower():
+                        if vector_size is None:
+                            raise ValueError(
+                                "Collection not found and vector_size is unknown. "
+                                "Provide vector_size before creating a new collection."
+                            )
                         try:
                             # Create new collection
                             self.qdrant_client.create_collection(
@@ -303,25 +338,35 @@ class RAGAgent:
             logger.info(f"✅ Query embedding generated in {embed_time:.3f}s (dim: {len(query_embedding)})")
             
             # Vector similarity search
-            logger.info(f"🔎 Searching vector database (threshold: 0.3)...")
+            threshold = getattr(Config, "RETRIEVAL_SCORE_THRESHOLD", 0)
+            if threshold and threshold > 0:
+                logger.info(f"🔎 Searching vector database (threshold: {threshold})...")
+            else:
+                logger.info("🔎 Searching vector database (no score threshold)...")
             search_start = time.time()
             # Use dynamic vector name for search
             if hasattr(self, 'vector_name') and self.vector_name:
                 query_vector = (self.vector_name, query_embedding)
             else:
                 query_vector = query_embedding
+            
+            search_kwargs = {
+                "collection_name": self.collection_name,
+                "query_vector": query_vector,
+                "limit": k,
+            }
+            if threshold and threshold > 0:
+                search_kwargs["score_threshold"] = threshold
                 
-            search_results = self.qdrant_client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                limit=k,
-                score_threshold=0.3
-            )
+            search_results = self.qdrant_client.search(**search_kwargs)
             search_time = time.time() - search_start
             logger.info(f"✅ Vector search completed in {search_time:.3f}s")
             
             if not search_results:
-                logger.info("❌ No relevant documents found above threshold")
+                if threshold and threshold > 0:
+                    logger.info("❌ No relevant documents found above threshold")
+                else:
+                    logger.info("❌ No relevant documents found")
                 return "No relevant information found in the loaded documents."
             
             # Process results
@@ -393,22 +438,33 @@ class RAGAgent:
             raise ValueError("No documents loaded. Please upload a document first.")
         
         # Create a simple retriever function that uses our query_documents method
-        class SimpleRetriever:
-            def __init__(self, rag_agent):
-                self.rag_agent = rag_agent
-            
-            def get_relevant_documents(self, query):
+        from langchain_core.documents import Document
+
+        class SimpleRetriever(BaseRetriever):
+            rag_agent: "RAGAgent"
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+
+            def _format_result(self, text: str):
+                if not text:
+                    return []
+                normalized = text.strip()
+                if not normalized or normalized.startswith("No documents loaded") or normalized.startswith("No relevant information") or normalized.startswith("Error querying documents"):
+                    return []
+                return [Document(page_content=normalized)]
+
+            def _get_relevant_documents(self, query, *, run_manager=None):
                 result = self.rag_agent.query_documents(query)
-                # Return as document-like objects
-                from langchain_core.documents import Document
-                return [Document(page_content=result)]
+                return self._format_result(result)
+
+            async def _aget_relevant_documents(self, query, *, run_manager=None):
+                return self._get_relevant_documents(query, run_manager=run_manager)
         
-        retriever = SimpleRetriever(self)
+        retriever = SimpleRetriever(rag_agent=self)
         
         return create_retriever_tool(
             retriever,
             "retrieve_documents",
-            "Search and return information from uploaded documents. Use this when users ask questions about document content."
+            "Search and return information from uploaded documents. ALWAYS use this tool first when documents are available, even for general questions, to check if the documents contain relevant information."
         )
 
 if __name__ == "__main__":

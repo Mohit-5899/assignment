@@ -1,12 +1,15 @@
 langchain==0.3.10
+langchain-core>=0.3.23,<0.4.0
 langgraph==0.2.58
 langsmith==0.1.147
-openai==1.57.2
-langchain-openai==1.0.2
+openai>=1.58.1,<2.0.0
+langchain-openai==0.2.14
+langchain-text-splitters>=0.3.2
 qdrant-client==1.15.1
 streamlit==1.40.2
 python-dotenv==1.0.1
 PyMuPDF==1.24.14
+pymupdf==1.24.14
 requests==2.32.3
 pytest==8.3.3
 pytest-asyncio==0.24.0
